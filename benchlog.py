@@ -102,7 +102,38 @@ def log_config(log: logging.Logger, what: str, cfg: dict) -> None:
     log.debug("%s config:\n%s", what, json.dumps(cfg, indent=2, default=str))
 
 
-def log_sample_output(log: logging.Logger, tag: str, text: str, limit: int = 800) -> None:
-    """Log a decoded sample generation to the file so you can eyeball quality."""
+def log_sample_output(log: logging.Logger, tag: str, text: str, limit: int = 1200,
+                      task: str | None = None) -> None:
+    """Log a decoded sample generation to the file so you can eyeball quality.
+    Pass `task` to record the prompt it was answering (prompt->output pair)."""
     clipped = text[:limit] + (" …[clipped]" if len(text) > limit else "")
-    log.debug("sample output [%s]:\n%s", tag, clipped)
+    if task is not None:
+        log.debug("sample output [%s]\n  TASK: %s\n  OUTPUT:\n%s", tag, task, clipped)
+    else:
+        log.debug("sample output [%s]:\n%s", tag, clipped)
+
+
+def log_mem(log: logging.Logger, tag: str) -> None:
+    """Log current GPU memory. Goes to console too -- cheap and very diagnostic
+    for 'did the previous model actually get freed' questions."""
+    import torch
+    if not torch.cuda.is_available():
+        return
+    alloc = torch.cuda.memory_allocated() / 1e9
+    reserved = torch.cuda.memory_reserved() / 1e9
+    peak = torch.cuda.max_memory_allocated() / 1e9
+    log.info("[mem] %-22s allocated=%5.1fGB  reserved=%5.1fGB  peak=%5.1fGB",
+             tag, alloc, reserved, peak)
+
+
+def gpu_gc(log: logging.Logger | None = None, tag: str = "after gc") -> None:
+    """Force a real GPU free: caller must `del` its own references FIRST, then
+    call this. (A helper can't free an object the caller still has a name for.)"""
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.reset_peak_memory_stats()
+    if log is not None:
+        log_mem(log, tag)

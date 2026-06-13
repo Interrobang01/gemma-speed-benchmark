@@ -29,7 +29,6 @@ and `huggingface-cli login` with Gemma 4 license accepted (gated models).
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import logging
 import time
@@ -150,7 +149,11 @@ def sweep_model(name: str, spec: dict, vram_gb: float, concurrencies, max_tokens
 
     results["sweet_spot"] = {"agents": peak_K, "agg_tok_s": round(peak_agg, 1)}
     log.info("  >> sweet spot: %d agents @ %.0f aggregate tok/s", peak_K, peak_agg)
-    _free(llm)
+    # del must happen here (where the name lives) for the GPU to actually free,
+    # else the MTP engine below loads on top of the baseline engine -> OOM.
+    benchlog.log_mem(log, "before free (baseline)")
+    del llm
+    benchlog.gpu_gc(log, "after free (baseline)")
 
     # ---- 2. Intervention: MTP at low concurrency AND at the sweet spot -----
     # MTP helps most when the GPU is underutilized (few agents); at the
@@ -174,23 +177,14 @@ def sweep_model(name: str, spec: dict, vram_gb: float, concurrencies, max_tokens
                 )
                 log.info("  agents=%4d  per-agent=%7.1f tok/s   speedup=%.2fx   agg=%.0f tok/s",
                          K, per_agent, speedup, agg)
-            _free(llm)
+            del llm
+            benchlog.gpu_gc(log, "after free (mtp)")
         except Exception as e:  # MTP wiring is the most fragile part; don't kill the run
             log.warning("  [MTP run failed: %s: %s]", type(e).__name__, e)
             log.debug("  MTP traceback:", exc_info=True)
             results["mtp_error"] = str(e)
 
     return results
-
-
-def _free(llm):
-    """vLLM holds the GPU until the engine is GC'd; force it between models."""
-    try:
-        del llm
-    except Exception:
-        pass
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def main():

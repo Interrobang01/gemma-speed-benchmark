@@ -34,7 +34,6 @@ Run:  python bench_hf.py                  # both models, default sweep
 from __future__ import annotations
 
 import argparse
-import gc
 import json
 import logging
 import time
@@ -97,9 +96,10 @@ def build_model(spec: dict, vram_gb: float):
 
 
 @torch.inference_mode()
-def time_run(model, tok, convos, max_tokens: int, sample: bool = False):
+def time_run(model, tok, convos, max_tokens: int, n_samples: int = 0):
     """Generate for K conversations as one padded batch. Returns (wall_s,
-    out_tokens, prompt_len). Forces exactly max_tokens new tokens per sequence."""
+    out_tokens, prompt_len). Forces exactly max_tokens new tokens per sequence.
+    n_samples>0 logs that many full prompt->output pairs to the logfile."""
     prompts = [tok.apply_chat_template(c, tokenize=False, add_generation_prompt=True)
                for c in convos]
     enc = tok(prompts, return_tensors="pt", padding=True).to(model.device)
@@ -122,9 +122,11 @@ def time_run(model, tok, convos, max_tokens: int, sample: bool = False):
 
     gen = out[:, prompt_len:]             # min==max forces full width, all real tokens
     out_toks = gen.shape[0] * gen.shape[1]
-    if sample:
-        benchlog.log_sample_output(log, f"K={len(convos)}",
-                                   tok.decode(gen[0], skip_special_tokens=True))
+    for i in range(min(n_samples, gen.shape[0])):
+        benchlog.log_sample_output(
+            log, f"K={len(convos)} agent#{i}",
+            tok.decode(gen[i], skip_special_tokens=True),
+            task=convos[i][1]["content"])
     return dt, out_toks, prompt_len
 
 
@@ -133,17 +135,19 @@ def sweep_model(name: str, spec: dict, vram_gb: float, concurrencies, max_tokens
     results = {"label": spec["label"], "id": spec["id"], "frontier": []}
 
     model, tok = build_model(spec, vram_gb)
+    benchlog.log_mem(log, "after load")
 
     # Warmup: first generate() pays one-time CUDA/kernel init; don't time it.
     log.debug("  warmup generate (K=2, 16 tokens) ...")
-    time_run(model, tok, build_conversations(2), 16, sample=True)
+    time_run(model, tok, build_conversations(2), 16)
 
     peak_agg, peak_K = 0.0, 0
     for K in concurrencies:
         convos = build_conversations(K, share_prefix=True)
         try:
+            # Log a few full prompt->output pairs at the first concurrency.
             dt, toks, plen = time_run(model, tok, convos, max_tokens,
-                                      sample=(K == concurrencies[0]))
+                                      n_samples=(3 if K == concurrencies[0] else 0))
         except torch.cuda.OutOfMemoryError:
             log.warning("  agents=%4d  -> CUDA OOM (no paged KV cache); stopping sweep", K)
             results["oom_at"] = K
@@ -169,17 +173,13 @@ def sweep_model(name: str, spec: dict, vram_gb: float, concurrencies, max_tokens
     results["sweet_spot"] = {"agents": peak_K, "agg_tok_s": round(peak_agg, 1)}
     log.info("  >> sweet spot: %d agents @ %.0f aggregate tok/s", peak_K, peak_agg)
 
-    _free(model)
+    # Free THIS model before the next one loads. The del must happen here, where
+    # the references actually live -- a helper deleting its own parameter alias
+    # leaves these frame-locals alive and frees nothing.
+    benchlog.log_mem(log, "before free")
+    del model, tok
+    benchlog.gpu_gc(log, "after free")
     return results
-
-
-def _free(model):
-    try:
-        del model
-    except Exception:
-        pass
-    gc.collect()
-    torch.cuda.empty_cache()
 
 
 def main():
@@ -187,7 +187,10 @@ def main():
     ap.add_argument("--models", nargs="+", default=["moe", "dense"],
                     choices=list(MODELS))
     ap.add_argument("--concurrency", type=int, nargs="+",
-                    default=[1, 2, 4, 8, 16, 32, 64],  # naive HF OOMs early; sweep is shorter
+                    # Extend past where naive HF is expected to peak so the sweep
+                    # ends on OOM or a real post-peak drop -- never on the list
+                    # running out (which would hide whether a higher K is better).
+                    default=[1, 4, 16, 64, 128, 256],
                     help="agent counts (batch sizes) to sweep")
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--quick", action="store_true")
