@@ -48,9 +48,9 @@ def vram_gb() -> float:
     return torch.cuda.get_device_properties(0).total_memory / (1024 ** 3)
 
 
-def make_vllm(model_id, quant, max_len, max_seqs, out_tokens):
+def make_vllm(model_id, quant, max_len, max_seqs, out_tokens, gpu_util):
     from vllm import LLM, SamplingParams
-    kwargs = dict(model=model_id, max_model_len=max_len, gpu_memory_utilization=0.90,
+    kwargs = dict(model=model_id, max_model_len=max_len, gpu_memory_utilization=gpu_util,
                   max_num_seqs=max_seqs, enable_prefix_caching=True,
                   quantization=quant, disable_log_stats=True)
     benchlog.log_config(log, "vLLM LLM", kwargs)
@@ -68,9 +68,9 @@ def make_vllm(model_id, quant, max_len, max_seqs, out_tokens):
     return gen
 
 
-def make_sglang(model_id, quant, max_len, max_seqs, out_tokens, tok):
+def make_sglang(model_id, quant, max_len, max_seqs, out_tokens, tok, gpu_util):
     import sglang as sgl
-    kwargs = dict(model_path=model_id, context_length=max_len, mem_fraction_static=0.90,
+    kwargs = dict(model_path=model_id, context_length=max_len, mem_fraction_static=gpu_util,
                   quantization=quant, disable_radix_cache=False)
     benchlog.log_config(log, "sgl.Engine", kwargs)
     log.info("building SGLang engine (context_length=%d) ...", max_len)
@@ -102,6 +102,10 @@ def main():
                     help="size of the identical system/tools prefix (prefix-cache target)")
     ap.add_argument("--out-tokens", type=int, default=128,
                     help="tokens generated per agent (the test is about prompt KV, not output)")
+    ap.add_argument("--gpu-util", type=float, default=0.90,
+                    help="vLLM gpu_memory_utilization / SGLang mem_fraction_static. "
+                         "Since v0.21 CUDA-graph profiling eats ~1.4%% of this; push "
+                         "toward ~0.93 to maximize KV cache for a capacity test")
     ap.add_argument("--quick", action="store_true")
     ap.add_argument("--out", default=None)
     ap.add_argument("--log", default=None)
@@ -137,9 +141,9 @@ def main():
         log.info("[ctx] <60GB GPU -> quantizing MoE weights (%s) to free KV room", quant)
 
     if args.engine == "vllm":
-        gen = make_vllm(model_id, quant, max_len, max_seqs, args.out_tokens)
+        gen = make_vllm(model_id, quant, max_len, max_seqs, args.out_tokens, args.gpu_util)
     else:
-        gen = make_sglang(model_id, quant, max_len, max_seqs, args.out_tokens, tok)
+        gen = make_sglang(model_id, quant, max_len, max_seqs, args.out_tokens, tok, args.gpu_util)
 
     results = {"engine": args.engine, "model": args.model, "vram_gb": round(vram, 1),
                "shared_prefix_tokens": sys_tokens, "out_tokens": args.out_tokens, "grid": {}}
