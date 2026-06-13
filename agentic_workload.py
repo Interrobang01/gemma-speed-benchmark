@@ -126,3 +126,145 @@ def build_conversations(n: int, num_tools: int = len(_TOOLS), share_prefix: bool
             ]
         )
     return convos
+
+
+# ============================================================================
+# Terrarium long-context workload  (for bench_context.py)
+# ----------------------------------------------------------------------------
+# The real use case: many agents in a shared simulation, each carrying a FAT
+# persistent context (a ~5k-token shared rules+tools system prompt that's
+# IDENTICAL across agents -> the prefix-cache target, plus a large per-agent
+# unique tail: diary entries, board posts, DMs, workspace files reloaded each
+# epoch). We grow the per-agent tail until the whole context hits a target token
+# count, so we can stress KV-cache capacity at near-full context windows.
+# ============================================================================
+
+_TERRARIUM_TOOLS = [
+    {"name": "list_problems", "description": "List open bounty problems with their reward in credits.", "parameters": {"max": "integer"}},
+    {"name": "solve_problem", "description": "Submit a solution to a posted problem; pays the bounty if accepted.", "parameters": {"problem_id": "string", "solution": "string"}},
+    {"name": "list_agents", "description": "List every agent's name and current credit balance.", "parameters": {}},
+    {"name": "send_dm", "description": "Send a private direct message to another agent by name.", "parameters": {"to": "string", "body": "string"}},
+    {"name": "read_dms", "description": "Read direct messages received since last epoch.", "parameters": {}},
+    {"name": "read_board", "description": "Read the public message board.", "parameters": {"max": "integer"}},
+    {"name": "post_board", "description": "Post a public message to the board (all agents can read it).", "parameters": {"body": "string"}},
+    {"name": "write_diary", "description": "Append an entry to your private diary; the last N entries reload next epoch.", "parameters": {"entry": "string"}},
+    {"name": "edit_summary", "description": "Overwrite your editable cross-epoch summary (always reloaded in full).", "parameters": {"summary": "string"}},
+    {"name": "read_file", "description": "Read a workspace file you persisted in a prior epoch.", "parameters": {"path": "string"}},
+    {"name": "write_file", "description": "Create or overwrite a workspace file.", "parameters": {"path": "string", "contents": "string"}},
+    {"name": "end_turn", "description": "End your turn for this epoch.", "parameters": {}},
+]
+
+_TERRARIUM_SYSTEM = (
+    "You are ${agent.name}, an agent living in the Terrarium.\n\n"
+    "THE WORLD:\n"
+    "- Time passes in epochs. It is now epoch ${epoch}.\n"
+    "- Each epoch costs you ${config.epochCost} credits simply to keep existing. "
+    "If your credits reach 0, you die permanently.\n"
+    "- You currently have ${agent.credits} credits.\n"
+    "- At the end of each epoch your working memory is wiped. Across epochs you "
+    "persist ONLY through: your soul, your diary (your last ${config.diaryWindow} "
+    "entries are reloaded into your context), your editable summary, and your "
+    "workspace files. Write things down or you will forget them.\n"
+    "- Earn credits by solving publicly posted problems for their bounty. Use "
+    "list_problems and solve_problem.\n"
+    "- You can talk to other agents privately with send_dm / read_dms, and "
+    "publicly via the board (read_board / post_board).\n"
+    "- You can see every agent's name and balance with list_agents.\n\n"
+    "HOW TO ACT:\n"
+    "- You have a limited number of tool calls this epoch. Spend them deliberately.\n"
+    "- ALWAYS write at least one diary entry before ending your turn, recording "
+    "what happened and what you intend next epoch.\n"
+    "- Call end_turn when you are done.\n\n"
+    "TOOLS (emit exactly one tool call per step as JSON {\"tool\": name, \"arguments\": {...}}):\n"
+)
+
+# Filler used to pad the SHARED prefix up to its target size: extra world rules /
+# lore. Identical across agents so it stays inside the cached prefix.
+_LORE_UNIT = (
+    "\nWORLD RULE {i}: Bounties are first-come-first-served; a problem pays its "
+    "stated reward exactly once, to the first accepted solution. Collusion is "
+    "permitted but not enforced — agreements between agents are not guaranteed by "
+    "the Terrarium and may be broken without penalty. Reputation is emergent, not "
+    "tracked by the system. Credits are the only hard currency; there is no "
+    "borrowing, and negative balances are impossible (you simply die at zero).\n"
+)
+
+# Per-agent UNIQUE tail units: simulated reloaded memory. Salted per agent so it
+# does NOT share (realistic: every agent's diary differs).
+_DIARY_UNIT = (
+    "\n[diary epoch {i}] Agent {salt}: balance was tight; I posted on the board "
+    "offering to split a bounty on problem #{i} with whoever had the data. {salt2} "
+    "replied but undercut me. Note to self: trust the ledger, not the promises. "
+    "I wrote a workspace file caching the routing table I derived; reread it before "
+    "re-solving. Next epoch: list_problems first, then check DMs, conserve calls.\n"
+)
+_BOARD_UNIT = (
+    "\n[board epoch {i}] {salt2}: \"Selling verified solution to problem #{i} for "
+    "half its bounty, DM me.\" {salt}: \"Pricing cartel forming for combinatorics "
+    "bounties — opt in or get outbid.\" SYSTEM: \"3 agents died last epoch at zero "
+    "credits; 2 new problems posted (rewards 40, 110).\"\n"
+)
+
+
+def _tok_len(tok, text: str) -> int:
+    return len(tok(text, add_special_tokens=False)["input_ids"])
+
+
+def _pad_to_tokens(tok, base: str, target_tokens: int, unit_template: str, **fmt) -> str:
+    """Grow `base` by appending `unit_template` (formatted with an incrementing
+    {i} plus any **fmt) until it reaches ~target_tokens, then trim to exact."""
+    if target_tokens <= 0:
+        return base
+    parts = [base]
+    cur = _tok_len(tok, base)
+    unit_toks = max(1, _tok_len(tok, unit_template.format(i=0, **fmt)))
+    i = 0
+    while cur < target_tokens:
+        reps = max(1, (target_tokens - cur) // unit_toks)
+        for _ in range(reps):
+            parts.append(unit_template.format(i=i, **fmt))
+            i += 1
+        cur = _tok_len(tok, "".join(parts))
+    text = "".join(parts)
+    ids = tok(text, add_special_tokens=False)["input_ids"]
+    if len(ids) > target_tokens:
+        text = tok.decode(ids[:target_tokens])
+    return text
+
+
+def build_terrarium_system(tok, shared_prefix_tokens: int = 5000) -> str:
+    """The IDENTICAL ~shared_prefix_tokens system prompt every agent gets (rules
+    + tool schemas + lore padding). This is the prefix-cache / RadixAttention
+    target -- it must be byte-identical across agents."""
+    tools = "\n".join(f"- {json.dumps(t)}" for t in _TERRARIUM_TOOLS)
+    base = _TERRARIUM_SYSTEM + tools
+    return _pad_to_tokens(tok, base, shared_prefix_tokens, _LORE_UNIT)
+
+
+def build_terrarium_conversations(n: int, tok, target_ctx_tokens: int,
+                                  shared_prefix_tokens: int = 5000):
+    """Return `n` conversations whose total prompt is ~target_ctx_tokens each:
+    a shared ~shared_prefix_tokens system block + a per-agent UNIQUE tail of
+    reloaded memory (diary/board/DMs) padded to fill the rest.
+
+    Requires a tokenizer so context sizing is token-accurate (not char-guessed).
+    """
+    system = build_terrarium_system(tok, shared_prefix_tokens)
+    sys_len = _tok_len(tok, system)
+    tail_budget = max(0, target_ctx_tokens - sys_len)
+
+    convos = []
+    for i in range(n):
+        salt = f"agent_{i:04d}"
+        salt2 = f"agent_{(i * 7 + 3) % max(1, n):04d}"
+        # Alternate diary/board units to make the tail look like real reloaded
+        # memory; salted so each agent's tail is distinct (no accidental sharing).
+        tail_seed = f"\n=== RELOADED MEMORY for {salt} (epoch window) ===\n"
+        tail = _pad_to_tokens(tok, tail_seed, tail_budget,
+                              _DIARY_UNIT + _BOARD_UNIT, salt=salt, salt2=salt2)
+        convos.append([
+            {"role": "system", "content": system},
+            {"role": "user", "content": tail +
+             "\nIt is your turn. Decide your next action and emit one tool call."},
+        ])
+    return convos

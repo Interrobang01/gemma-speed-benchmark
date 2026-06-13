@@ -103,7 +103,7 @@ def run(model_id: str, concurrencies, max_tokens: int):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="moe", choices=list(MODELS))
-    ap.add_argument("--concurrency", type=int, nargs="+", default=[1, 16, 64, 256])
+    ap.add_argument("--concurrency", type=int, nargs="+", default=[1, 16, 64, 256, 512])
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--out", default="results_sglang.json")
     ap.add_argument("--log", default="bench_sglang.log")

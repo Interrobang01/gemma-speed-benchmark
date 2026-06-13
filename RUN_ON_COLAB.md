@@ -94,9 +94,20 @@ for f in ("bench_hf.log", "bench_vllm.log", "bench_sglang.log"):
     except Exception as e: print("skip", f, e)
 ```
 
+## Cell E — context / KV-capacity stress (optional)  — run in the vLLM **or** SGLang runtime
+Maps how many long-context Terrarium agents fit before KV cache saturates. Run it
+in whichever engine's runtime is already live (no new install needed):
+```python
+!python bench_context.py --engine vllm     # in the vLLM runtime; or --engine sglang in the SGLang one
+```
+Sweeps context_length (4k→64k) × concurrency with a ~5k shared system prefix and a
+big per-agent unique memory tail. Writes `results_context_<engine>.json` +
+`bench_context_<engine>.log`, and prints a 2D tok/s grid (rows=context, cols=agents).
+`--quick` for a fast 2×2 probe; `--context`/`--concurrency`/`--shared-prefix` to tune.
+
 ---
 
-## Knobs (all three scripts share these unless noted)
+## Knobs (all scripts share these unless noted)
 - `--quick` — tiny sweep, short outputs, for verifying it runs end to end.
 - `--concurrency 1 8 32 128` — custom agent counts. HF defaults to a shorter
   sweep (`1 2 4 8 16 32 64`) because it OOMs early.

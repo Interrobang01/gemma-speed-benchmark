@@ -194,7 +194,7 @@ def main():
                     help="which models to benchmark (dense 31B is opt-in: too big "
                          "for one A100 for marginal quality gain)")
     ap.add_argument("--concurrency", type=int, nargs="+",
-                    default=[1, 4, 16, 64, 128, 256],
+                    default=[1, 4, 16, 64, 128, 256, 512],
                     help="agent counts to sweep")
     ap.add_argument("--max-tokens", type=int, default=256,
                     help="output tokens per agent (fixed, ignore_eos)")
