@@ -184,8 +184,10 @@ def sweep_model(name: str, spec: dict, vram_gb: float, concurrencies, max_tokens
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", nargs="+", default=["moe", "dense"],
-                    choices=list(MODELS))
+    ap.add_argument("--models", nargs="+", default=["moe"],
+                    choices=list(MODELS),
+                    help="dense 31B is opt-in: too big for one A100 (and plain "
+                         "transformers dequantizes the w4a16 checkpoint to bf16)")
     ap.add_argument("--concurrency", type=int, nargs="+",
                     # Extend past where naive HF is expected to peak so the sweep
                     # ends on OOM or a real post-peak drop -- never on the list

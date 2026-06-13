@@ -189,8 +189,10 @@ def sweep_model(name: str, spec: dict, vram_gb: float, concurrencies, max_tokens
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--models", nargs="+", default=["moe", "dense"],
-                    choices=list(MODELS), help="which models to benchmark")
+    ap.add_argument("--models", nargs="+", default=["moe"],
+                    choices=list(MODELS),
+                    help="which models to benchmark (dense 31B is opt-in: too big "
+                         "for one A100 for marginal quality gain)")
     ap.add_argument("--concurrency", type=int, nargs="+",
                     default=[1, 4, 16, 64, 128, 256],
                     help="agent counts to sweep")
