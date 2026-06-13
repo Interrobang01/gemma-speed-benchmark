@@ -31,11 +31,15 @@ from __future__ import annotations
 import argparse
 import gc
 import json
+import logging
 import time
 
 import torch
 
+import benchlog
 from agentic_workload import build_conversations
+
+log = logging.getLogger("bench")
 
 # ----------------------------------------------------------------------------
 # Model registry. Precision is chosen at runtime from detected VRAM.
@@ -83,17 +87,22 @@ def build_llm(spec: dict, vram_gb: float, mtp_tokens: int = 0):
     # On 40GB, the bf16 MoE won't fit -> apply weight-only quant if defined.
     if vram_gb < 60 and spec.get("quant_40gb"):
         kwargs["quantization"] = spec["quant_40gb"]
-        print(f"  [40GB GPU detected -> quantization={spec['quant_40gb']}]")
+        log.info("  [<60GB GPU detected -> quantization=%s]", spec["quant_40gb"])
     if mtp_tokens > 0:
         kwargs["speculative_config"] = {
             "method": "mtp",
             "model": spec["assistant"],
             "num_speculative_tokens": mtp_tokens,
         }
-    return LLM(**kwargs)
+    benchlog.log_config(log, f"vLLM LLM (mtp_tokens={mtp_tokens})", kwargs)
+    log.info("  building vLLM engine for %s (mtp_tokens=%d) ...", spec["id"], mtp_tokens)
+    t0 = time.perf_counter()
+    llm = LLM(**kwargs)
+    log.info("  engine ready in %.1fs", time.perf_counter() - t0)
+    return llm
 
 
-def time_run(llm, convos, max_tokens: int):
+def time_run(llm, convos, max_tokens: int, sample: bool = False):
     """Run K conversations to completion; return wall seconds and total out toks."""
     from vllm import SamplingParams
 
@@ -103,46 +112,51 @@ def time_run(llm, convos, max_tokens: int):
     outs = llm.chat(convos, sp, use_tqdm=False)
     dt = time.perf_counter() - t0
     out_toks = sum(len(o.outputs[0].token_ids) for o in outs)
+    if sample and outs:
+        benchlog.log_sample_output(log, f"K={len(convos)}", outs[0].outputs[0].text)
     return dt, out_toks
 
 
 def sweep_model(name: str, spec: dict, vram_gb: float, concurrencies, max_tokens: int,
                 mtp_tokens: int):
-    print(f"\n{'='*72}\n{spec['label']}  ({spec['id']})\n{'='*72}")
+    log.info("\n%s\n%s  (%s)\n%s", "=" * 72, spec["label"], spec["id"], "=" * 72)
     results = {"label": spec["label"], "id": spec["id"], "frontier": [], "mtp": []}
 
     # ---- 1. Baseline frontier (no MTP) -------------------------------------
     llm = build_llm(spec, vram_gb, mtp_tokens=0)
     # Warmup: triggers CUDA graph capture + prefix-cache fill so it isn't timed.
-    time_run(llm, build_conversations(2), 16)
+    log.debug("  warmup (K=2, 16 tokens) + capturing a sample output ...")
+    time_run(llm, build_conversations(2), 16, sample=True)
 
     peak_agg, peak_K = 0.0, 0
     for K in concurrencies:
         convos = build_conversations(K, share_prefix=True)
-        dt, toks = time_run(llm, convos, max_tokens)
+        dt, toks = time_run(llm, convos, max_tokens, sample=(K == concurrencies[0]))
         agg = toks / dt
         per_agent = agg / K
         results["frontier"].append(
             {"agents": K, "agg_tok_s": round(agg, 1),
              "per_agent_tok_s": round(per_agent, 1), "wall_s": round(dt, 2)}
         )
-        print(f"  agents={K:4d}  agg={agg:8.1f} tok/s   per-agent={per_agent:7.1f} tok/s   wall={dt:6.2f}s")
+        log.debug("  detail K=%d  out_toks=%d  wall=%.3fs", K, toks, dt)
+        log.info("  agents=%4d  agg=%8.1f tok/s   per-agent=%7.1f tok/s   wall=%6.2fs",
+                 K, agg, per_agent, dt)
         if agg > peak_agg:
             peak_agg, peak_K = agg, K
         # Early stop: once aggregate falls well below the peak, we're past the knee.
         elif agg < 0.85 * peak_agg:
-            print("  (aggregate past its peak -> stopping sweep)")
+            log.info("  (aggregate past its peak -> stopping sweep)")
             break
 
     results["sweet_spot"] = {"agents": peak_K, "agg_tok_s": round(peak_agg, 1)}
-    print(f"  >> sweet spot: {peak_K} agents @ {peak_agg:.0f} aggregate tok/s")
+    log.info("  >> sweet spot: %d agents @ %.0f aggregate tok/s", peak_K, peak_agg)
     _free(llm)
 
     # ---- 2. Intervention: MTP at low concurrency AND at the sweet spot -----
     # MTP helps most when the GPU is underutilized (few agents); at the
     # throughput sweet spot the batch already saturates compute so it may not.
     if mtp_tokens > 0:
-        print(f"\n  -- intervention: MTP (num_speculative_tokens={mtp_tokens}) --")
+        log.info("\n  -- intervention: MTP (num_speculative_tokens=%d) --", mtp_tokens)
         try:
             llm = build_llm(spec, vram_gb, mtp_tokens=mtp_tokens)
             time_run(llm, build_conversations(2), 16)
@@ -158,11 +172,12 @@ def sweep_model(name: str, spec: dict, vram_gb: float, concurrencies, max_tokens
                      "per_agent_tok_s": round(per_agent, 1),
                      "speedup_vs_baseline": round(speedup, 2)}
                 )
-                print(f"  agents={K:4d}  per-agent={per_agent:7.1f} tok/s   "
-                      f"speedup={speedup:.2f}x   agg={agg:.0f} tok/s")
+                log.info("  agents=%4d  per-agent=%7.1f tok/s   speedup=%.2fx   agg=%.0f tok/s",
+                         K, per_agent, speedup, agg)
             _free(llm)
         except Exception as e:  # MTP wiring is the most fragile part; don't kill the run
-            print(f"  [MTP run failed: {type(e).__name__}: {e}]")
+            log.warning("  [MTP run failed: %s: %s]", type(e).__name__, e)
+            log.debug("  MTP traceback:", exc_info=True)
             results["mtp_error"] = str(e)
 
     return results
@@ -192,16 +207,21 @@ def main():
     ap.add_argument("--quick", action="store_true",
                     help="tiny sweep + short outputs for a ~3 min smoke test")
     ap.add_argument("--out", default="results_vllm.json")
+    ap.add_argument("--log", default="bench_vllm.log")
     args = ap.parse_args()
 
     if args.quick:
         args.concurrency = [1, 8, 64]
         args.max_tokens = 128
 
-    vram = gpu_vram_gb()
-    print(f"GPU: {torch.cuda.get_device_name(0)}  |  VRAM: {vram:.0f} GB")
+    benchlog.setup(args.log)
+    benchlog.log_env(log)
+    benchlog.log_workload_example(log)
 
-    all_results = {"vram_gb": round(vram, 1), "models": {}}
+    vram = gpu_vram_gb()
+    benchlog.log_config(log, "run args", vars(args))
+
+    all_results = {"engine": "vllm", "vram_gb": round(vram, 1), "models": {}}
     t0 = time.perf_counter()
     for name in args.models:
         all_results["models"][name] = sweep_model(
@@ -210,7 +230,8 @@ def main():
 
     with open(args.out, "w") as f:
         json.dump(all_results, f, indent=2)
-    print(f"\nTotal wall: {all_results['total_wall_s']}s   ->  wrote {args.out}")
+    log.info("\nTotal wall: %ss   ->  wrote %s  (and log -> %s)",
+             all_results["total_wall_s"], args.out, args.log)
 
 
 if __name__ == "__main__":

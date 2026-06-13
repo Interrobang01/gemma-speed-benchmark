@@ -21,11 +21,15 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import time
 
 import torch
 
+import benchlog
 from agentic_workload import build_conversations
+
+log = logging.getLogger("bench")
 
 MODELS = {
     "moe": "google/gemma-4-26B-A4B-it",          # fits bf16 on 80GB
@@ -50,21 +54,23 @@ def run(model_id: str, concurrencies, max_tokens: int):
 
     tok = AutoTokenizer.from_pretrained(model_id)
     quant = "w8a8_int8" if vram_gb() < 60 and "qat" not in model_id else None
-    print(f"Loading {model_id} (quant={quant}) ...")
+    engine_kwargs = dict(model_path=model_id, mem_fraction_static=0.90,
+                         context_length=8192, quantization=quant,
+                         disable_radix_cache=False)
+    benchlog.log_config(log, "sgl.Engine", engine_kwargs)
+    log.info("Loading %s (quant=%s) ...", model_id, quant)
+    t0 = time.perf_counter()
     # RadixAttention prefix caching is ON by default in SGLang.
-    llm = sgl.Engine(
-        model_path=model_id,
-        mem_fraction_static=0.90,
-        context_length=8192,
-        quantization=quant,
-        disable_radix_cache=False,
-    )
+    llm = sgl.Engine(**engine_kwargs)
+    log.info("  engine ready in %.1fs", time.perf_counter() - t0)
     sp = {"temperature": 0.7, "top_p": 0.9, "max_new_tokens": max_tokens,
           "ignore_eos": True}
+    benchlog.log_config(log, "sampling params", sp)
 
     results = {"id": model_id, "shared": [], "unshared": []}
     for share in (True, False):
         key = "shared" if share else "unshared"
+        log.debug("  warmup [%s] (K=2) -- also primes the radix cache when shared", key)
         # Warmup also primes the radix cache when share=True.
         llm.generate(_to_prompts(build_conversations(2, share_prefix=share), tok), sp)
         for K in concurrencies:
@@ -77,14 +83,17 @@ def run(model_id: str, concurrencies, max_tokens: int):
             results[key].append({"agents": K, "agg_tok_s": round(agg, 1),
                                  "per_agent_tok_s": round(agg / K, 1),
                                  "wall_s": round(dt, 2)})
-            print(f"  [{key:8s}] agents={K:4d}  agg={agg:8.1f} tok/s  "
-                  f"per-agent={agg/K:7.1f} tok/s  wall={dt:6.2f}s")
+            if K == concurrencies[0] and outs:
+                benchlog.log_sample_output(log, f"{key} K={K}", outs[0]["text"])
+                log.debug("  meta_info[0]: %s", outs[0].get("meta_info"))
+            log.info("  [%-8s] agents=%4d  agg=%8.1f tok/s  per-agent=%7.1f tok/s  wall=%6.2fs",
+                     key, K, agg, agg / K, dt)
 
     # Speedup from prefix sharing at each concurrency.
-    print("\n  prefix-cache win (shared / unshared aggregate tok/s):")
+    log.info("\n  prefix-cache win (shared / unshared aggregate tok/s):")
     for s, u in zip(results["shared"], results["unshared"]):
         win = s["agg_tok_s"] / u["agg_tok_s"] if u["agg_tok_s"] else float("nan")
-        print(f"    agents={s['agents']:4d}  {win:.2f}x")
+        log.info("    agents=%4d  %.2fx", s["agents"], win)
         s["prefix_win"] = round(win, 2)
 
     llm.shutdown()
@@ -97,13 +106,19 @@ def main():
     ap.add_argument("--concurrency", type=int, nargs="+", default=[1, 16, 64, 256])
     ap.add_argument("--max-tokens", type=int, default=256)
     ap.add_argument("--out", default="results_sglang.json")
+    ap.add_argument("--log", default="bench_sglang.log")
     args = ap.parse_args()
 
-    print(f"GPU: {torch.cuda.get_device_name(0)}  |  VRAM: {vram_gb():.0f} GB")
+    benchlog.setup(args.log)
+    benchlog.log_env(log)
+    benchlog.log_workload_example(log)
+    benchlog.log_config(log, "run args", vars(args))
+
     res = run(MODELS[args.model], args.concurrency, args.max_tokens)
+    res["engine"] = "sglang"
     with open(args.out, "w") as f:
         json.dump(res, f, indent=2)
-    print(f"\nwrote {args.out}")
+    log.info("\nwrote %s  (and log -> %s)", args.out, args.log)
 
 
 if __name__ == "__main__":
